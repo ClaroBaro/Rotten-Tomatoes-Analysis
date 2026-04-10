@@ -1,0 +1,10 @@
+# Data CSVs (too large for GitHub — share via Kaggle/Google Drive)
+data/*.csv
+
+# Jupyter
+**/.ipynb_checkpoints/
+
+# Python cache
+**/__pycache__/
+**/*.pyc
+**/*.pyo
