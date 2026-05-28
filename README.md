@@ -6,7 +6,7 @@ We have all experienced the excitement of being recommended an interesting movie
 Historical Rotten Tomatoes Data: [https://www.kaggle.com/datasets/stefanoleone992/rotten-tomatoes-movies-and-critic-reviews-dataset](url)
 
 ## EDA Inquiries & Findings
-#### 1. [Audience Ratings] Does Rotten Tomatoes' Popcorn Score (public audience score) have a positive association with Tomato Score? 
+#### 1A. [Audience Ratings] Does Rotten Tomatoes' Popcorn Score (public audience score) have a positive association with Tomato Score? 
 <img width="681" height="545" alt="image" src="https://github.com/user-attachments/assets/2104ec84-78cb-4d12-9803-37ef2c3c65e5" />
 
 The $R^2$ of this relationship is only 0.343. Audience scores differed from critic scores in the following numbers: 
@@ -23,6 +23,12 @@ To our surprise, only 2% of movies had equal critic and audience scores, indicat
 
 
 Additionally, to answer if audience scores are biased towards underating or overating, the proportions across 25000+ movies tell us they are only slightly more likely to underate.
+
+#### 1B. [Budget Effects] Does a movie's production budget have a positive association with Tomato Score? 
+<img width="571" height="432" alt="image" src="https://github.com/user-attachments/assets/b36a47ef-c482-4ef4-a1af-7ea9799e9b95" />
+
+There is practically zero association between a movie's production budget and its final rotten tomato score ($R^2$ = 0.003), which is quite surprising as one might expect movies with access to more elevated graphics and tools to produce more positively critiqued films. For our data analysis purposes, this means that budget cannot be used as a primary prior predictor of a movie's success, in terms of rotten tomato score.
+
 
 #### 2. [Critic Ratings] Who are the most 'consistent' critics? Do they have the 'topCritic' designation? 
 Top 10 critics with highest fresh/rotten accuracy & 100+ reviews:
