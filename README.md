@@ -67,6 +67,10 @@ Bias is normally distributed with mean -1.7, slightly underating on average.
 Vader model performs very poorly with our review data. roBERTa model performs decently well, achieving an $R^2$ of 0.491 when tomato score is regressed on roBERTa's sentiment score. Correlation is 0.687. Sentiment model is not accurate enough to benefit our model currently; retry after more review text data is obtained via webscraping. 
 
 
+## Usage: 
+Terminal script: 
+c:\Users\claro\anaconda3\envs\STSCIModeling\python.exe src/usage/analyze.py "[Director Name]" "[Writer Name]" --fresh XX --total YY --thresholds xx xx xx --market # above:price # above:price # above:price
+
 
 
 
