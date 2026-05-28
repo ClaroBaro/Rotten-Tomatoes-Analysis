@@ -3,7 +3,7 @@ import pandas as pd
 
 '''
 Cleaning the originalScore column of the Kaggle dataset and standardizing the 
-wide variety of score evaluation systems. 
+wide variety of score evaluation systems found from webscraped publication review scores. 
 '''
 def standardize_score(score):
     try: 
@@ -44,7 +44,7 @@ def standardize_score(score):
         # Handle letter grades with word modifiers e.g. 'A minus', 'B plus', 'B-plus', 'C minus'
         letter_word = re.match(r'^([a-f])[- ](plus|minus)$', score)
         if letter_word:
-            grade_map = {'a': 95, 'b': 70, 'c': 50, 'd': 30, 'f': 5}
+            grade_map = {'a':95, 'b': 70, 'c': 50, 'd': 30, 'f': 5}
             modifier = {'plus': 5, 'minus': -5}
             return grade_map[letter_word.group(1)] + modifier[letter_word.group(2)]
         

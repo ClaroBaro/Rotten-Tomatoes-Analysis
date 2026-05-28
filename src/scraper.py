@@ -35,11 +35,9 @@ Usage
 
 import re
 import time
-from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
-from bs4 import BeautifulSoup
 
 
 _HEADERS = {
@@ -62,22 +60,124 @@ class MovieScraper:
     ----------
     movie_name : str
         Title of the movie (e.g. "Inception").
+    data_path : str, optional
+        Path to master_table.csv from the Kaggle dataset. When provided,
+        the scraper automatically selects the top N publications by lowest
+        combined RMSE + bias from your historical data instead of the
+        hard-coded fallback list.
+    n_publications : int
+        How many top publications to target (default 50).
+    min_reviews : int
+        Minimum review count a publication must have in the dataset to
+        be considered (default 100, for a stable RMSE estimate).
     omdb_key : str, optional
         Free key from https://www.omdbapi.com/apikey.aspx (1,000 req/day).
     twitter_bearer : str, optional
         Bearer token from https://developer.x.com (free Basic tier).
     """
 
+    # Fallback used only when data_path is not provided
+    _FALLBACK_PUBLICATIONS = [
+        "Variety", "The Hollywood Reporter", "IndieWire", "RogerEbert.com",
+        "The Guardian", "New York Times", "Chicago Sun-Times", "NPR",
+        "Entertainment Weekly", "New York Post", "San Francisco Chronicle",
+        "Time Out", "Slant Magazine", "Austin Chronicle", "The Wrap",
+        "Los Angeles Times", "Washington Post", "Rolling Stone", "Filmsite", 
+        "The Jam Report", "Impression Blend", "NPR", "Women's Voices for Change",
+        "CineXpress Podcast", "Access Hollywood", "Austin Burke/Flick Fan Nation",
+        "Cine Sin Fronteras", "Cinema Siren", "Newshub", "Dark Horizons", 
+        "Detroit News", "iNews.co.uk", "Alternative Lens", "Kalamazoo Gazette", 
+        "CNN Radio", "Suburban Journals of St. Louis", "Panorama", "MovieJuice!"
+    ]
+
     def __init__(
         self,
         movie_name: str,
-        omdb_key: str = None,
-        twitter_bearer: str = None,
+        data_path: str | None = None,
+        n_publications: int = 50,
+        min_reviews: int = 100,
+        omdb_key: str | None = None,
+        twitter_bearer: str | None = None,
     ):
         self.movie_name = movie_name
         self.omdb_key = omdb_key
         self.twitter_bearer = twitter_bearer
         self._last_request_at = 0.0
+
+        if data_path:
+            self.publications = self.top_publications(
+                data_path, n=n_publications, min_reviews=min_reviews
+            )
+            print(f"[Publications] Loaded {len(self.publications)} publications from dataset.")
+        else:
+            self.publications = self._FALLBACK_PUBLICATIONS
+
+    # ------------------------------------------------------------------
+    # Derive top publications from historical data
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def top_publications(
+        data_path: str,
+        n: int = 50,
+        min_reviews: int = 100,
+    ) -> list[str]:
+        """
+        Read master_table.csv and return the top N publication names ranked
+        by a combined score of low RMSE and low absolute bias — i.e. the
+        publications whose scores most closely track the final tomatoMeter.
+
+        Parameters
+        ----------
+        data_path : str
+            Path to master_table.csv.
+        n : int
+            Number of publications to return.
+        min_reviews : int
+            Minimum reviews a publication must have for a stable estimate.
+        """
+        master = pd.read_csv(data_path)
+        master = master.dropna(subset=["tomatoMeter", "reviewId", "originalScore"])
+        master = master.drop_duplicates(subset=["reviewId"])
+
+        # reuse standardize_score to get numeric scores
+        try:
+            from src.cleaning import standardize_score
+        except ImportError:
+            from cleaning import standardize_score
+
+        master["standardized_score"] = master["originalScore"].apply(standardize_score)
+        master = master.dropna(subset=["standardized_score"])
+
+        master["resid"]        = master["standardized_score"] - master["tomatoMeter"]
+        master["squared_resid"] = master["resid"] ** 2
+
+        pub_stats = (
+            master.groupby("publicatioName")
+            .agg(
+                review_count=("reviewId",       "count"),
+                rmse        =("squared_resid",  lambda x: x.mean() ** 0.5),
+                mean_bias   =("resid",          "mean"),
+            )
+            .reset_index()
+        )
+
+        pub_stats = pub_stats[pub_stats["review_count"] >= min_reviews].copy()
+
+        # normalize both metrics to [0, 1] then average — lower is better
+        for col in ("rmse", "mean_bias"):
+            lo = pub_stats[col].abs().min()
+            hi = pub_stats[col].abs().max()
+            pub_stats[f"{col}_norm"] = (pub_stats[col].abs() - lo) / (hi - lo + 1e-9)
+
+        pub_stats["combined"] = (pub_stats["rmse_norm"] + pub_stats["mean_bias_norm"]) / 2
+        top = pub_stats.nsmallest(n, "combined")
+
+        print(f"[Publications] Top {len(top)} publications (RMSE range: "
+              f"{top['rmse'].min():.1f}–{top['rmse'].max():.1f}, "
+              f"bias range: {top['mean_bias'].min():.1f}–{top['mean_bias'].max():.1f})")
+
+        return top["publicatioName"].tolist()
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -86,8 +186,8 @@ class MovieScraper:
     def _get(
         self,
         url: str,
-        params: dict = None,
-        headers: dict = None,
+        params: dict | None = None,
+        headers: dict | None = None,
         delay: float = _RATE_LIMIT_SEC,
     ) -> requests.Response:
         """Rate-limited GET. Raises on non-2xx status."""
@@ -151,41 +251,111 @@ class MovieScraper:
         return scores
 
     # ------------------------------------------------------------------
-    # 2. Metacritic — individual critic review list
+    # 2. Publication reviews — search Google News per publication,
+    #    scrape full article text, extract score with standardize_score
     # ------------------------------------------------------------------
 
-    def scrape_metacritic(self, max_reviews: int = 30) -> list[dict]:
+    def scrape_publication_reviews(
+        self,
+        publications: list[str] | None = None,
+    ) -> list[dict]:
         """
-        Scrape individual critic reviews from Metacritic.
+        For each publication, search Google News for a review of the movie,
+        scrape the full article text, and attempt to extract a numeric score.
 
-        Returns a list of dicts with keys:
-            critic, publication, score (0-100), snippet
+        Uses trafilatura for article text extraction (more reliable than
+        newspaper3k on Python 3.11+).  Install: pip install trafilatura gnews
 
-        Note: Metacritic may return a 403 if they detect automated requests.
-        If that happens try adding a 'Cookie' header from a real browser session.
+        Parameters
+        ----------
+        publications : list of str, optional
+            Publication names to search. Defaults to DEFAULT_PUBLICATIONS.
         """
-        url = f"https://www.metacritic.com/movie/{self._slug(self.movie_name)}/critic-reviews/"
         try:
-            resp = self._get(url)
-        except requests.HTTPError as e:
-            print(f"[Metacritic] HTTP {e.response.status_code} — the movie slug may be wrong, "
-                  f"or Metacritic is blocking the request.")
-            print(f"  Tried URL: {url}")
+            from gnews import GNews
+        except ImportError:
+            print("[Publications] Run: pip install gnews")
             return []
 
-        soup = BeautifulSoup(resp.text, "html.parser")
+        try:
+            import trafilatura
+        except ImportError:
+            print("[Publications] Run: pip install trafilatura")
+            return []
+
+        try:
+            from src.cleaning import standardize_score
+        except ImportError:
+            from cleaning import standardize_score
+
+        pubs = publications or self.publications
         reviews = []
 
-        for card in soup.select(".c-siteReview")[:max_reviews]:
-            reviews.append({
-                "source":      "metacritic",
-                "critic":      _text(card, ".c-siteReview_criticName"),
-                "publication": _text(card, ".c-siteReview_publicationName"),
-                "score":       _text(card, ".c-siteReviewScore"),
-                "snippet":     _text(card, ".c-siteReview_quote"),
-            })
+        for pub in pubs:
+            gn = GNews(language="en", country="US", max_results=5)
+            query = f'"{self.movie_name}" review {pub}'
 
-        print(f"[Metacritic] {len(reviews)} reviews scraped.")
+            try:
+                candidates = gn.get_news(query)
+            except Exception as e:
+                print(f"[Publications] {pub}: search failed — {e}")
+                continue
+
+            # prefer articles whose publisher name matches
+            matched = [
+                r for r in candidates
+                if pub.lower() in r.get("publisher", {}).get("title", "").lower()
+            ]
+            item = (matched or candidates or [None])[0]
+            if not item:
+                continue
+
+            url = item.get("url")
+            if not url:
+                continue
+
+            # scrape full article text + metadata
+            article_date = None
+            html = ""
+            try:
+                html = trafilatura.fetch_url(url) or ""
+                extracted = trafilatura.bare_extraction(html) or {}
+                text = extracted.get("text") or ""
+                article_date = extracted.get("date")
+            except Exception:
+                text = ""
+
+            # fall back to article title if scraping failed
+            if not text:
+                text = item.get("title", "")
+
+            # skip articles not actually about this movie (e.g. related-article sidebars)
+            if not _is_relevant_article(text, item.get("title", ""), self.movie_name):
+                print(f"  [{pub}] Skipping — article does not appear to be about {self.movie_name!r}")
+                continue
+
+            pub_date = item.get("published date") or article_date
+
+            # structured data (JSON-LD / schema.org) is most reliable; fall back to text
+            score = (
+                _extract_structured_score(html)
+                or _extract_score(text)
+                or _extract_score(item.get("title", ""))
+            )
+
+            reviews.append({
+                "source":      "publication",
+                "publication": pub,
+                "url":         url,
+                "title":       item.get("title"),
+                "text":        text,
+                "score":       score,
+                "has_score":   score is not None,
+                "pub_date":    pub_date,
+            })
+            print(f"  [{pub}] {'score=' + str(score) if score else 'no score'} — {len(text)} chars")
+
+        print(f"[Publications] {len(reviews)}/{len(pubs)} publications found.")
         return reviews
 
     # ------------------------------------------------------------------
@@ -195,7 +365,7 @@ class MovieScraper:
     def scrape_google_news(
         self,
         max_articles: int = 20,
-        publications: list[str] = None,
+        publications: list[str] | None = None,
     ) -> list[dict]:
         """
         Search Google News for recent articles about the movie.
@@ -252,7 +422,7 @@ class MovieScraper:
 
     def scrape_reddit(
         self,
-        subreddits: list[str] = None,
+        subreddits: list[str] | None = None,
         limit: int = 25,
         sort: str = "top",
     ) -> list[dict]:
@@ -397,39 +567,39 @@ class MovieScraper:
 
     def scrape_all(
         self,
-        reddit_subreddits: list[str] = None,
+        publications: list[str] | None = None,
+        reddit_subreddits: list[str] | None = None,
         reddit_limit: int = 25,
-        metacritic_reviews: int = 30,
         twitter_limit: int = 20,
         news_articles: int = 20,
-        news_publications: list[str] = None,
+        news_publications: list[str] | None = None,
     ) -> dict:
         """
         Run all scrapers and return a combined results dict.
 
-        Keys: "omdb", "metacritic_reviews", "reddit_posts", "twitter", "google_news"
+        Keys: "omdb", "publication_reviews", "reddit_posts", "twitter", "google_news"
         """
         print(f"\n{'='*54}")
         print(f"  Scraping: {self.movie_name}")
         print(f"{'='*54}\n")
 
         results = {
-            "omdb": self.get_omdb_scores(),
-            "metacritic_reviews": self.scrape_metacritic(metacritic_reviews),
-            "reddit_posts": self.scrape_reddit(
-                subreddits=reddit_subreddits,
-                limit=reddit_limit,
-            ),
-            "twitter": self.scrape_twitter(twitter_limit),
-            "google_news": self.scrape_google_news(news_articles, news_publications),
+            "omdb":                self.get_omdb_scores(),
+            "publication_reviews": self.scrape_publication_reviews(publications),
+            "reddit_posts":        self.scrape_reddit(
+                                       subreddits=reddit_subreddits,
+                                       limit=reddit_limit,
+                                   ),
+            "twitter":             self.scrape_twitter(twitter_limit),
+            "google_news":         self.scrape_google_news(news_articles, news_publications),
         }
 
         print(f"\nSummary for '{self.movie_name}':")
-        print(f"  OMDB scores found:    {bool(results['omdb'])}")
-        print(f"  Metacritic reviews:   {len(results['metacritic_reviews'])}")
-        print(f"  Reddit posts:         {len(results['reddit_posts'])}")
-        print(f"  Tweets:               {len(results['twitter'])}")
-        print(f"  News articles:        {len(results['google_news'])}")
+        print(f"  OMDB scores found:      {bool(results['omdb'])}")
+        print(f"  Publication reviews:    {len(results['publication_reviews'])}")
+        print(f"  Reddit posts:           {len(results['reddit_posts'])}")
+        print(f"  Tweets:                 {len(results['twitter'])}")
+        print(f"  News articles:          {len(results['google_news'])}")
         return results
 
     def to_dataframe(self, results: dict) -> dict[str, pd.DataFrame]:
@@ -439,8 +609,8 @@ class MovieScraper:
         Keys: "critic_reviews", "reddit", "twitter", "news"
         """
         dfs = {}
-        if results.get("metacritic_reviews"):
-            dfs["critic_reviews"] = pd.DataFrame(results["metacritic_reviews"])
+        if results.get("publication_reviews"):
+            dfs["critic_reviews"] = pd.DataFrame(results["publication_reviews"])
         if results.get("reddit_posts"):
             dfs["reddit"] = pd.DataFrame(results["reddit_posts"])
         if results.get("twitter"):
@@ -449,46 +619,240 @@ class MovieScraper:
             dfs["news"] = pd.DataFrame(results["google_news"])
         return dfs
 
+    def to_sentiment_df(self, results: dict) -> pd.DataFrame:
+        """
+        Flatten scrape_all() results into a single DataFrame ready for
+        sentiment analysis.
+
+        Columns
+        -------
+        source       : where the text came from
+        text         : the text to run sentiment analysis on
+        score        : numeric score 0-100 where available, else NaN
+                       - Metacritic: critic score (already 0-100)
+                       - Reddit:     upvote_ratio * 100 (proxy for crowd approval)
+                       - Twitter:    NaN (no score)
+                       - News:       NaN (title only, no score)
+        has_score    : True if a real numeric score exists (Metacritic only)
+        """
+        rows = []
+
+        # Publication reviews — full article text + extracted score
+        for r in results.get("publication_reviews", []):
+            score = r.get("score")
+            rows.append({
+                "source":    "publication",
+                "text":      (r.get("text") or r.get("title") or "").strip(),
+                "score":     float(score) if score is not None else float("nan"),
+                "has_score": score is not None,
+                "meta":      r.get("publication", ""),
+            })
+
+        # Reddit — combine post title + body text; no score
+        for r in results.get("reddit_posts", []):
+            title = r.get("title") or ""
+            body  = r.get("selftext") or ""
+            text  = (title + " " + body).strip()
+            rows.append({
+                "source":    "reddit",
+                "text":      text,
+                "score":     float("nan"),
+                "has_score": False,
+                "meta":      "r/" + (r.get("subreddit") or ""),
+            })
+
+        # Twitter — tweet text only, no score
+        for r in results.get("twitter", []):
+            rows.append({
+                "source":    "twitter",
+                "text":      (r.get("text") or "").strip(),
+                "score":     float("nan"),
+                "has_score": False,
+                "meta":      "",
+            })
+
+        # Google News — article title as text proxy (full text needs article scraping)
+        for r in results.get("google_news", []):
+            rows.append({
+                "source":    "google_news",
+                "text":      (r.get("title") or "").strip(),
+                "score":     float("nan"),
+                "has_score": False,
+                "meta":      r.get("publication") or "",
+            })
+
+        df = pd.DataFrame(rows)
+        df = df[df["text"].str.len() > 0].reset_index(drop=True)   # drop blank rows
+        return df
+
 
 # ------------------------------------------------------------------
 # Module-level helpers
 # ------------------------------------------------------------------
 
-def _text(tag, selector: str) -> str | None:
-    """Extract stripped text from a CSS selector within a BeautifulSoup tag."""
-    el = tag.select_one(selector)
-    return el.get_text(strip=True) if el else None
-
-
-def _text_tag(item, tag_name: str) -> str | None:
-    """Extract stripped text from a named XML/HTML tag."""
-    el = item.find(tag_name)
-    return el.get_text(strip=True) if el else None
-
-
-def _resolve_google_news_url(url: str) -> str | None:
+def _is_relevant_article(text: str, title: str, movie_name: str) -> bool:
     """
-    Decode the real article URL from a Google News RSS link.
-
-    Google News RSS links (CBMi...) are base64url-encoded protobufs.
-    Following the redirect fails because Google requires browser cookies.
-    Instead, decode the protobuf locally and extract the embedded URL.
+    Return True only if the article is actually about this movie.
+    A page where the movie appears once in a sidebar will fail this check.
     """
-    import base64
-    if not url:
+    name = movie_name.lower()
+    if name in (title or "").lower():
+        return True
+    return (text or "").lower().count(name) >= 3
+
+
+def _extract_structured_score(html: str) -> float | None:
+    """
+    Extract a critic rating from structured data embedded in the page HTML:
+      - JSON-LD schema.org  (reviewRating / aggregateRating)
+      - itemprop="ratingValue" + itemprop="bestRating"
+      - <meta name="rating" content="...">
+    This is checked before any text-scraping because it is unambiguous.
+    """
+    if not html:
         return None
     try:
-        match = re.search(r"/articles/([^?]+)", url)
-        if not match:
-            return url
-        encoded = match.group(1)
-        # Restore base64 padding
-        encoded += "=" * (4 - len(encoded) % 4)
-        decoded = base64.urlsafe_b64decode(encoded)
-        # The article URL is embedded as a UTF-8 string inside the protobuf binary
-        url_match = re.search(rb"https?://[^\x00-\x20\x7f-\xff]+", decoded)
-        if url_match:
-            return url_match.group().decode("utf-8", errors="ignore")
-        return url
+        import json
+        from bs4 import BeautifulSoup
+        try:
+            from src.cleaning import standardize_score
+        except ImportError:
+            from cleaning import standardize_score
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        # 1. JSON-LD schema.org
+        for script in soup.find_all("script", type="application/ld+json"):
+            try:
+                data = json.loads(script.string or "")
+                if isinstance(data, list):
+                    data = data[0] if data else {}
+                for key in ("reviewRating", "aggregateRating"):
+                    rating = data.get(key, {})
+                    if not isinstance(rating, dict):
+                        continue
+                    value = rating.get("ratingValue")
+                    best  = rating.get("bestRating", 10)
+                    if value:
+                        return round(float(value) / float(best) * 100, 1)
+            except Exception:
+                continue
+
+        # 2. itemprop microdata
+        rv_el = soup.find(attrs={"itemprop": "ratingValue"})
+        br_el = soup.find(attrs={"itemprop": "bestRating"})
+        if rv_el:
+            value = rv_el.get("content") or rv_el.get_text(strip=True)
+            best  = (br_el.get("content") or br_el.get_text(strip=True)) if br_el else "10"
+            try:
+                return round(float(value) / float(best) * 100, 1)
+            except Exception:
+                pass
+
+        # 3. <meta name="rating" content="...">
+        meta = soup.find("meta", attrs={"name": re.compile(r"rating", re.I)})
+        if meta:
+            score = standardize_score(meta.get("content", ""))
+            if score is not None:
+                return score
+
+        return None
     except Exception:
-        return url
+        return None
+
+
+def _extract_score(text: str) -> float | None:
+    """
+    Scan article text for a critic score and normalize it to 0-100.
+
+    Strategy (in priority order):
+    1. Explicit rating labels anywhere in the text ("Rating: 1.5/5", "Score: B+")
+       — catches dedicated rating blocks like the one on rendyreviews.com
+    2. Score patterns in the first + last 600 chars (lede and sign-off)
+    3. Score patterns anywhere in the full text (middle of review)
+    """
+    if not text:
+        return None
+    try:
+        from src.cleaning import standardize_score
+    except ImportError:
+        from cleaning import standardize_score
+
+    # Written-out star ratings: "four stars out of five", "three and a half stars out of four"
+    _word_num = {
+        'zero': 0, 'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+        'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+    }
+    word_stars = re.search(
+        r'\b(zero|one|two|three|four|five|six|seven|eight|nine|ten)'
+        r'(?:\s+and\s+(?:a\s+)?half)?'
+        r'\s*[-\s]?stars?\s+(?:out\s+of|/)\s*'
+        r'(zero|one|two|three|four|five|six|seven|eight|nine|ten)\b',
+        text, re.IGNORECASE
+    )
+    if word_stars:
+        num = _word_num.get(word_stars.group(1).lower(), 0)
+        # check for "and a half" between the number word and "stars"
+        between = text[word_stars.start(1):word_stars.start(2)]
+        if re.search(r'and\s+(?:a\s+)?half', between, re.IGNORECASE):
+            num += 0.5
+        den = _word_num.get(word_stars.group(2).lower(), 0)
+        if den:
+            score = standardize_score(f"{num}/{den}")
+            if score is not None:
+                return score
+
+    # Pre-normalize "1.5 stars / 5 stars" → "1.5/5" so standardize_score can handle it
+    stars_pattern = re.compile(
+        r'(\d+\.?\d*)\s*(?:stars?\s*/|/)\s*(\d+\.?\d*)\s*stars?'
+        r'|(\d+\.?\d*)\s*(?:stars?\s+)?out\s+of\s+(\d+\.?\d*)\s*stars?',
+        re.IGNORECASE
+    )
+    sm = stars_pattern.search(text)
+    if sm:
+        num, den = (sm.group(1), sm.group(2)) if sm.group(1) else (sm.group(3), sm.group(4))
+        score = standardize_score(f"{num}/{den}")
+        if score is not None:
+            return score
+
+    score_patterns = [
+        r'\d+\.?\d*\s*/\s*\d+',           # 1.5/5, 8/10
+        r'\d+\.?\d*\s*out\s*of\s*\d+',    # 3 out of 5
+        r'\d+\s*%',                         # 80%
+        r'[A-Fa-f][+-]?(?=\s|$)',          # B+, C-
+        r'[★✩]{1,5}',                      # star symbols
+    ]
+
+    # 1. Look for explicit label + score anywhere in the text
+    label_pattern = re.compile(
+        r'(?:rating|score|grade|verdict|stars?|our\s+rating|critic\s+score|review\s+score)'
+        r'\s*[:\-–]\s*([^\n]{1,40})',
+        re.IGNORECASE
+    )
+    for m in label_pattern.finditer(text):
+        candidate = m.group(1).strip()
+        for sp in score_patterns:
+            sm = re.search(sp, candidate, re.IGNORECASE)
+            if sm:
+                score = standardize_score(sm.group(0))
+                if score is not None:
+                    return score
+
+    # 2. Search first + last 600 chars
+    search_zone = text[:600] + " " + text[-600:]
+    for sp in score_patterns:
+        m = re.search(sp, search_zone, re.IGNORECASE)
+        if m:
+            score = standardize_score(m.group(0))
+            if score is not None:
+                return score
+
+    # 3. Full text scan as last resort
+    for sp in score_patterns:
+        m = re.search(sp, text, re.IGNORECASE)
+        if m:
+            score = standardize_score(m.group(0))
+            if score is not None:
+                return score
+
+    return None
